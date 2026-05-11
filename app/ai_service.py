@@ -176,7 +176,247 @@ def generate_patient_reply(
     # 如果底层调用失败，会返回【模型调用失败】等提示，这里直接返回，方便前端和日志看到原因。
     return content
 
+def _contains_any(text: str, keywords: List[str]) -> bool:
+    return any(keyword in text for keyword in keywords)
 
+
+def _analyze_dialogue_coverage(dialogue_messages: List[Dict]) -> Dict[str, Any]:
+    """
+    分析本次对话中学生实际问到了哪些病史维度。
+    注意：这里只分析学生/医生提问，不分析 AI 病人自己说了什么。
+    """
+    student_questions = []
+
+    for msg in dialogue_messages:
+        sender_type = msg.get("sender_type", "")
+        content = (msg.get("content") or "").strip()
+
+        if sender_type == "student" and content:
+            student_questions.append(content)
+
+    student_text = "\n".join(student_questions)
+
+    coverage = {
+        "student_turn_count": len(student_questions),
+
+        # 主诉/就诊原因
+        "chief_complaint": _contains_any(
+            student_text,
+            ["哪里不舒服", "哪儿不舒服", "怎么了", "什么不舒服", "为什么来", "就诊原因", "主要问题", "主要症状"]
+        ),
+
+        # 现病史：时间、程度、频率、诱因、伴随症状、处理经过等
+        "history_of_present_illness": _contains_any(
+            student_text,
+            ["多久", "多长时间", "什么时候", "几次", "频率", "量多", "量少", "颜色", "疼不疼", "腹痛", "腰酸", "诱因", "缓解", "加重", "处理", "用药", "治疗", "伴随"]
+        ),
+
+        # 月经史
+        "menstrual_history": _contains_any(
+            student_text,
+            ["月经", "经期", "周期", "末次月经", "LMP", "绝经", "停经", "经量", "痛经"]
+        ),
+
+        # 婚育史/性生活/避孕
+        "marital_reproductive_sexual_history": _contains_any(
+            student_text,
+            ["结婚", "婚育", "生育", "怀孕", "妊娠", "生产", "流产", "剖宫产", "性生活", "同房", "性行为", "性伴侣", "避孕", "安全套", "不安全"]
+        ),
+
+        # 既往史、慢性病、过敏史
+        "past_history": _contains_any(
+            student_text,
+            ["既往", "以前", "病史", "高血压", "糖尿病", "慢性病", "过敏", "手术", "用药史", "免疫", "长期服药"]
+        ),
+
+        # 妇科既往史、宫颈治疗史、阴道镜史
+        "gynecological_history": _contains_any(
+            student_text,
+            ["妇科病", "宫颈炎", "宫颈病变", "宫颈治疗", "宫颈手术", "LEEP", "锥切", "阴道镜", "活检", "妇科检查"]
+        ),
+
+        # HPV/TCT/筛查/疫苗
+        "screening_and_examination_history": _contains_any(
+            student_text,
+            ["HPV", "TCT", "筛查", "宫颈癌筛查", "细胞学", "疫苗", "HPV疫苗", "检查结果", "复查"]
+        ),
+
+        # 白带/分泌物
+        "vaginal_discharge": _contains_any(
+            student_text,
+            ["白带", "分泌物", "异味", "气味", "颜色", "瘙痒", "外阴痒"]
+        ),
+
+        # 接触性出血/同房后出血
+        "contact_bleeding": _contains_any(
+            student_text,
+            ["同房后出血", "接触性出血", "性生活后出血", "同房之后出血", "房事后出血"]
+        ),
+    }
+
+    covered_count = sum(
+        1 for key, value in coverage.items()
+        if key != "student_turn_count" and value
+    )
+
+    coverage["covered_key_area_count"] = covered_count
+    coverage["student_questions"] = student_questions
+
+    return coverage
+
+
+def _grade_from_score(score: int) -> str:
+    if score >= 90:
+        return "优秀"
+    if score >= 80:
+        return "良好"
+    if score >= 70:
+        return "合格"
+    if score >= 60:
+        return "基本达标，需加强"
+    return "未达标，建议重新训练"
+
+
+def _calculate_score_cap(coverage: Dict[str, Any]) -> int:
+    """
+    根据实际问诊轮次和关键维度覆盖情况设置最高分。
+    目的：防止问诊很草率时模型仍然给高分。
+    """
+    student_turn_count = coverage.get("student_turn_count", 0)
+    covered_key_area_count = coverage.get("covered_key_area_count", 0)
+
+    # 先根据问诊轮次设置基础上限
+    if student_turn_count <= 2:
+        cap = 50
+    elif student_turn_count <= 3:
+        cap = 60
+    elif student_turn_count <= 5:
+        cap = 70
+    elif student_turn_count <= 8:
+        cap = 80
+    else:
+        cap = 90
+
+    # 再根据关键维度覆盖情况限制上限
+    if covered_key_area_count <= 2:
+        cap = min(cap, 55)
+    elif covered_key_area_count <= 4:
+        cap = min(cap, 65)
+    elif covered_key_area_count <= 6:
+        cap = min(cap, 78)
+
+    # 妇科问诊关键项缺失时进一步扣上限
+    if not coverage.get("menstrual_history"):
+        cap -= 5
+
+    if not coverage.get("past_history"):
+        cap -= 5
+
+    if not coverage.get("screening_and_examination_history"):
+        cap -= 8
+
+    if not coverage.get("gynecological_history"):
+        cap -= 5
+
+    # 最低保留一个合理下限
+    return max(35, cap)
+
+
+def _apply_report_constraints(report_data: Dict[str, Any], coverage: Dict[str, Any]) -> Dict[str, Any]:
+    """
+    对模型生成结果进行后处理：
+    1. 没问到的病史维度强制标注为“未涉及”；
+    2. 分数超过上限时强制压低；
+    3. 等级与分数重新匹配。
+    """
+    structured_report = report_data.setdefault("structured_report", {})
+
+    # 主诉：如果学生连就诊原因都没问，主诉也不应自动生成
+    if not coverage.get("chief_complaint"):
+        structured_report["chief_complaint"] = "未涉及"
+
+    # 现病史：如果没有追问症状时间、频率、性质等，不能自动写完整现病史
+    if not coverage.get("history_of_present_illness"):
+        structured_report["history_of_present_illness"] = "未涉及"
+
+    # 月经婚育及性生活相关史需要拆开处理
+    menstrual_part = "月经史：未涉及"
+    reproductive_part = "婚育史：未涉及"
+    sexual_part = "性生活相关史：未涉及"
+
+    existing_mmr = structured_report.get("menstrual_marital_reproductive_history", "")
+
+    if coverage.get("menstrual_history") and existing_mmr:
+        menstrual_part = f"月经史：{existing_mmr}"
+    if coverage.get("marital_reproductive_sexual_history") and existing_mmr:
+        sexual_part = f"性生活/婚育相关史：{existing_mmr}"
+
+    if not coverage.get("menstrual_history") and not coverage.get("marital_reproductive_sexual_history"):
+        structured_report["menstrual_marital_reproductive_history"] = "月经史：未涉及；婚育史：未涉及；性生活相关史：未涉及"
+    else:
+        structured_report["menstrual_marital_reproductive_history"] = f"{menstrual_part}；{reproductive_part}；{sexual_part}"
+
+    if not coverage.get("past_history"):
+        structured_report["past_history"] = "未涉及"
+
+    if not coverage.get("gynecological_history"):
+        structured_report["gynecological_history"] = "未涉及"
+
+    if not coverage.get("screening_and_examination_history"):
+        structured_report["screening_and_examination_history"] = "未涉及"
+
+    # 强制限制分数
+    cap = _calculate_score_cap(coverage)
+    raw_score = int(report_data.get("score", 0) or 0)
+    final_score = min(raw_score, cap)
+
+    report_data["score"] = final_score
+    report_data["grade"] = _grade_from_score(final_score)
+
+    # 如果总分被压低，同步压低维度分，避免维度分之和看起来仍然过高
+    dimension_scores = report_data.get("dimension_scores", [])
+    if isinstance(dimension_scores, list):
+        total_dimension_score = 0
+
+        for item in dimension_scores:
+            try:
+                total_dimension_score += int(item.get("score", 0))
+            except Exception:
+                pass
+
+        if total_dimension_score > final_score and total_dimension_score > 0:
+            ratio = final_score / total_dimension_score
+
+            for item in dimension_scores:
+                try:
+                    original = int(item.get("score", 0))
+                    item["score"] = max(0, int(round(original * ratio)))
+                except Exception:
+                    pass
+
+    # 追加遗漏提醒，确保学生知道哪些没问
+    missed_key_points = report_data.setdefault("missed_key_points", [])
+
+    def add_missing(text: str):
+        if text not in missed_key_points:
+            missed_key_points.append(text)
+
+    if not coverage.get("menstrual_history"):
+        add_missing("未询问月经史，如月经周期、经期、经量、末次月经或是否绝经。")
+
+    if not coverage.get("past_history"):
+        add_missing("未询问既往史、慢性病史、过敏史或长期用药史。")
+
+    if not coverage.get("gynecological_history"):
+        add_missing("未询问既往妇科疾病史、宫颈治疗史或既往阴道镜检查史。")
+
+    if not coverage.get("screening_and_examination_history"):
+        add_missing("未询问HPV、TCT、宫颈癌筛查或HPV疫苗接种情况。")
+
+    if not coverage.get("contact_bleeding"):
+        add_missing("未明确追问是否存在同房后出血或接触性出血。")
+
+    return report_data
 def generate_consultation_report(
     case_title: str,
     dialogue_messages: List[Dict],
@@ -184,7 +424,10 @@ def generate_consultation_report(
 ) -> Dict[str, Any]:
     """
     根据本次问诊对话与学生提交的初步判断，生成结构化问诊报告与教学评价。
+    本函数严格限制模型只能基于本次对话生成报告，未问到的信息必须标注“未涉及”。
     """
+
+    coverage = _analyze_dialogue_coverage(dialogue_messages)
 
     dialogue_text = ""
 
@@ -204,19 +447,37 @@ def generate_consultation_report(
 
         dialogue_text += f"{role_name}：{content}\n"
 
+    coverage_summary = f"""
+本次问诊轮次统计：
+- 学生/医生提问轮次：{coverage.get("student_turn_count", 0)}
+- 实际覆盖关键维度数量：{coverage.get("covered_key_area_count", 0)}
+
+本次问诊是否涉及以下维度：
+- 主诉/就诊原因：{"已涉及" if coverage.get("chief_complaint") else "未涉及"}
+- 现病史细节：{"已涉及" if coverage.get("history_of_present_illness") else "未涉及"}
+- 月经史：{"已涉及" if coverage.get("menstrual_history") else "未涉及"}
+- 婚育史/性生活/避孕相关史：{"已涉及" if coverage.get("marital_reproductive_sexual_history") else "未涉及"}
+- 既往史/慢性病史/过敏史：{"已涉及" if coverage.get("past_history") else "未涉及"}
+- 妇科既往史/宫颈治疗史/阴道镜史：{"已涉及" if coverage.get("gynecological_history") else "未涉及"}
+- HPV/TCT/宫颈筛查/HPV疫苗：{"已涉及" if coverage.get("screening_and_examination_history") else "未涉及"}
+- 白带/阴道分泌物：{"已涉及" if coverage.get("vaginal_discharge") else "未涉及"}
+- 同房后出血/接触性出血：{"已涉及" if coverage.get("contact_bleeding") else "未涉及"}
+""".strip()
+
     system_prompt = """
-你是一名妇科临床教学教师，正在评价医学生的一次虚拟病人问诊训练。
+你是一名严格的妇科临床教学教师，正在评价医学生的一次虚拟病人问诊训练。
 
-请严格基于以下材料生成报告：
-1. 本次问诊对话记录；
-2. 学生提交的初步判断；
-3. 学生是否建议进行阴道镜检查；
-4. 学生填写的判断依据和下一步建议。
+请严格基于“本次问诊对话记录”生成报告与评价。
 
-平台定位：
-- 这是妇科问诊教学训练；
-- 核心训练目标包括：妇科病史采集、宫颈筛查异常相关问诊、判断是否需要阴道镜检查；
-- 输出仅用于医学教学训练，不作为真实医疗诊断建议。
+最重要的规则：
+1. 结构化问诊报告只能整理本次对话中明确出现的信息。
+2. 学生没有问到、AI病人也没有在本次对话中回答的信息，必须写“未涉及”。
+3. 绝对不能根据医学常识、病例名称、常规病历模板或你自己的推测补全信息。
+4. 绝对不能编造月经史、婚育史、既往史、筛查史、检查结果、家族史等内容。
+5. 如果某一项只问到一部分，要如实写出已问到部分，并明确标注其他部分“未涉及”。
+6. 评分必须严格。问诊轮次少、关键病史遗漏多，不能给高分，更不能评为“良好”或“优秀”。
+7. 本次输出仅用于医学教学训练，不作为真实医疗诊断建议。
+8. 必须返回合法 JSON，不要输出 Markdown，不要输出 JSON 以外的任何解释文字。
 
 评价维度采用100分制：
 1. 问诊结构完整性：20分
@@ -226,16 +487,11 @@ def generate_consultation_report(
 5. 医患沟通与人文关怀：10分
 6. 报告完整性与表达规范：5分
 
-评价要求：
-- 不要编造对话中完全没有的信息；
-- 对于对话中未询问或未获得的信息，应标注“未充分询问”或“未获得”；
-- 对学生表现的评价要像教师给医学生的反馈，具体、专业、可改进；
-- 重点评价学生是否围绕妇科主诉、宫颈筛查异常、阴道镜检查指征进行有效问诊；
-- 评分要有区分度，不要所有维度都给满分；
-- 如果学生问诊很少、信息不足，应降低相应维度分数；
-- 必须返回合法 JSON；
-- 不要输出 Markdown；
-- 不要输出 JSON 以外的任何解释文字。
+评分原则：
+- 如果学生提问少于3轮，总分通常不应超过60分；
+- 如果未询问月经史、既往史、妇科既往史、HPV/TCT筛查史等关键内容，总分通常不应超过65分；
+- 如果仅询问了主诉、白带和性生活安全性等少量问题，应明确指出问诊不完整；
+- 对遗漏项要在 weaknesses、improvement_suggestions 和 missed_key_points 中明确指出。
 """.strip()
 
     user_prompt = f"""
@@ -245,70 +501,74 @@ def generate_consultation_report(
 本次问诊对话记录：
 {dialogue_text}
 
+系统对本次对话覆盖情况的客观统计：
+{coverage_summary}
+
 学生提交内容：
 初步判断：{student_submission.get("initial_judgment", "")}
 是否建议阴道镜检查：{student_submission.get("colposcopy_decision", "")}
 判断依据：{student_submission.get("judgment_basis", "")}
 下一步建议：{student_submission.get("next_step_advice", "")}
 
-请严格按以下 JSON 格式返回，字段名不能改变：
+请严格按以下 JSON 格式返回，字段名不能改变。
+注意：下面只是字段格式，不代表可以照抄示例内容。所有内容必须来自本次对话；未问到的信息必须写“未涉及”。
 
 {{
-  "score": 82,
-  "grade": "良好",
+  "score": 0,
+  "grade": "未评分",
   "structured_report": {{
-    "chief_complaint": "自动整理主诉，格式建议为主要症状+持续时间；信息不足则写未充分询问",
-    "history_of_present_illness": "自动整理现病史，包括起病时间、症状特点、频率、诱因、伴随症状、诊疗经过等；信息不足则写未充分询问",
-    "menstrual_marital_reproductive_history": "整理月经婚育及性生活相关史；信息不足则写未充分询问",
-    "past_history": "整理既往史、过敏史、慢性病史等；信息不足则写未充分询问",
-    "gynecological_history": "整理妇科相关病史、手术史、流产史、宫颈治疗史等；信息不足则写未充分询问",
-    "screening_and_examination_history": "整理HPV、TCT、阴道镜、HPV疫苗等筛查和检查资料；信息不足则写未充分询问",
+    "chief_complaint": "只整理本次对话中明确出现的主诉；未问到则写未涉及",
+    "history_of_present_illness": "只整理本次对话中明确出现的现病史；未问到则写未涉及",
+    "menstrual_marital_reproductive_history": "分别写月经史、婚育史、性生活相关史；未问到的部分必须写未涉及",
+    "past_history": "只整理本次对话中明确出现的既往史；未问到则写未涉及",
+    "gynecological_history": "只整理本次对话中明确出现的妇科既往史、宫颈治疗史、阴道镜史；未问到则写未涉及",
+    "screening_and_examination_history": "只整理本次对话中明确出现的HPV、TCT、阴道镜、HPV疫苗等信息；未问到则写未涉及",
     "student_initial_judgment": "复述学生初步判断",
     "student_colposcopy_decision": "复述学生阴道镜检查选择",
     "student_judgment_basis": "复述学生判断依据",
     "student_next_step_advice": "复述学生下一步建议",
-    "system_reference_judgment": "系统参考判断，应说明这是教学参考，不是真实诊断"
+    "system_reference_judgment": "基于本次对话给出教学参考判断，并说明信息不足之处"
   }},
   "dimension_scores": [
     {{
       "name": "问诊结构完整性",
-      "score": 16,
+      "score": 0,
       "max_score": 20,
-      "comment": "简要评价该维度表现"
+      "comment": "评价是否覆盖主诉、现病史、月经婚育史、既往史等结构"
     }},
     {{
       "name": "妇科专科关键点覆盖",
-      "score": 20,
+      "score": 0,
       "max_score": 25,
-      "comment": "简要评价该维度表现"
+      "comment": "评价是否覆盖异常出血、白带、HPV/TCT、阴道镜史等妇科关键点"
     }},
     {{
       "name": "临床思维与阴道镜指征判断",
-      "score": 21,
+      "score": 0,
       "max_score": 25,
-      "comment": "简要评价该维度表现"
+      "comment": "评价学生判断是否合理，以及依据是否充分"
     }},
     {{
       "name": "问诊逻辑与问题质量",
-      "score": 12,
+      "score": 0,
       "max_score": 15,
-      "comment": "简要评价该维度表现"
+      "comment": "评价问题顺序、追问质量、是否聚焦"
     }},
     {{
       "name": "医患沟通与人文关怀",
-      "score": 8,
+      "score": 0,
       "max_score": 10,
-      "comment": "简要评价该维度表现"
+      "comment": "评价语气、隐私保护、解释敏感问题等"
     }},
     {{
       "name": "报告完整性与表达规范",
-      "score": 5,
+      "score": 0,
       "max_score": 5,
-      "comment": "简要评价该维度表现"
+      "comment": "评价学生提交判断是否清楚、依据是否规范"
     }}
   ],
-  "overall_feedback": "总体教师式评价，100到200字左右",
-  "strengths": ["优点1", "优点2", "优点3"],
+  "overall_feedback": "总体教师式评价，100到200字左右。必须明确指出本次问诊是否充分。",
+  "strengths": ["优点1", "优点2"],
   "weaknesses": ["不足1", "不足2", "不足3"],
   "improvement_suggestions": ["建议1", "建议2", "建议3"],
   "missed_key_points": ["遗漏点1", "遗漏点2", "遗漏点3"]
@@ -329,7 +589,7 @@ def generate_consultation_report(
 
     content = _call_chat_completion(
         messages=messages,
-        temperature=0.2,
+        temperature=0.1,
         timeout=90.0
     )
 
@@ -338,7 +598,6 @@ def generate_consultation_report(
 
     report_data = _safe_json_loads(content)
 
-    # 做一个基础兜底，防止模型漏字段导致前端崩掉。
     report_data.setdefault("score", 0)
     report_data.setdefault("grade", "未评分")
     report_data.setdefault("structured_report", {})
@@ -350,16 +609,18 @@ def generate_consultation_report(
     report_data.setdefault("missed_key_points", [])
 
     structured_report = report_data["structured_report"]
-    structured_report.setdefault("chief_complaint", "未生成")
-    structured_report.setdefault("history_of_present_illness", "未生成")
-    structured_report.setdefault("menstrual_marital_reproductive_history", "未生成")
-    structured_report.setdefault("past_history", "未生成")
-    structured_report.setdefault("gynecological_history", "未生成")
-    structured_report.setdefault("screening_and_examination_history", "未生成")
+    structured_report.setdefault("chief_complaint", "未涉及")
+    structured_report.setdefault("history_of_present_illness", "未涉及")
+    structured_report.setdefault("menstrual_marital_reproductive_history", "未涉及")
+    structured_report.setdefault("past_history", "未涉及")
+    structured_report.setdefault("gynecological_history", "未涉及")
+    structured_report.setdefault("screening_and_examination_history", "未涉及")
     structured_report.setdefault("student_initial_judgment", student_submission.get("initial_judgment", ""))
     structured_report.setdefault("student_colposcopy_decision", student_submission.get("colposcopy_decision", ""))
     structured_report.setdefault("student_judgment_basis", student_submission.get("judgment_basis", ""))
     structured_report.setdefault("student_next_step_advice", student_submission.get("next_step_advice", ""))
     structured_report.setdefault("system_reference_judgment", "未生成")
+
+    report_data = _apply_report_constraints(report_data, coverage)
 
     return report_data
