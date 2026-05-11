@@ -1,5 +1,5 @@
 from pydantic import BaseModel, Field
-from typing import Optional
+from typing import Optional, List
 
 
 class RegisterRequest(BaseModel):
@@ -50,7 +50,7 @@ class StartConsultationResponse(BaseModel):
     success: bool
     session_id: int
     case: dict
-    opening_message: OpeningMessage
+    opening_message: Optional[OpeningMessage] = None
 
 
 class SendMessageRequest(BaseModel):
@@ -74,3 +74,46 @@ class EndConsultationResponse(BaseModel):
     message: str
     session_id: int
     status: str
+
+
+class StudentSubmission(BaseModel):
+    session_id: int
+    initial_judgment: str
+    colposcopy_decision: str
+    judgment_basis: str
+    next_step_advice: Optional[str] = ""
+
+
+class DimensionScore(BaseModel):
+    name: str
+    score: int
+    max_score: int
+    comment: str
+
+
+class StructuredConsultationReport(BaseModel):
+    chief_complaint: str
+    history_of_present_illness: str
+    menstrual_marital_reproductive_history: str
+    past_history: str
+    gynecological_history: str
+    screening_and_examination_history: str
+    student_initial_judgment: str
+    student_colposcopy_decision: str
+    student_judgment_basis: str
+    student_next_step_advice: Optional[str] = ""
+    system_reference_judgment: str
+
+
+class ConsultationReportResponse(BaseModel):
+    success: bool
+    session_id: int
+    score: int
+    grade: str
+    structured_report: StructuredConsultationReport
+    dimension_scores: List[DimensionScore]
+    overall_feedback: str
+    strengths: List[str]
+    weaknesses: List[str]
+    improvement_suggestions: List[str]
+    missed_key_points: List[str]
