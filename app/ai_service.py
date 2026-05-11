@@ -339,22 +339,35 @@ def _apply_report_constraints(report_data: Dict[str, Any], coverage: Dict[str, A
     if not coverage.get("history_of_present_illness"):
         structured_report["history_of_present_illness"] = "未涉及"
 
-    # 月经婚育及性生活相关史需要拆开处理
-    menstrual_part = "月经史：未涉及"
-    reproductive_part = "婚育史：未涉及"
-    sexual_part = "性生活相关史：未涉及"
+  # 月经、婚育、性生活相关史：只保留本次问诊实际涉及的信息，避免重复套娃。
+existing_mmr = structured_report.get("menstrual_marital_reproductive_history", "")
 
-    existing_mmr = structured_report.get("menstrual_marital_reproductive_history", "")
+mmr_parts = []
 
-    if coverage.get("menstrual_history") and existing_mmr:
-        menstrual_part = f"月经史：{existing_mmr}"
-    if coverage.get("marital_reproductive_sexual_history") and existing_mmr:
-        sexual_part = f"性生活/婚育相关史：{existing_mmr}"
-
-    if not coverage.get("menstrual_history") and not coverage.get("marital_reproductive_sexual_history"):
-        structured_report["menstrual_marital_reproductive_history"] = "月经史：未涉及；婚育史：未涉及；性生活相关史：未涉及"
+if coverage.get("menstrual_history"):
+    if "月经史：" in existing_mmr:
+        menstrual_text = existing_mmr.split("月经史：", 1)[1].split("；", 1)[0].strip()
+        mmr_parts.append(f"月经史：{menstrual_text or '本次问诊已涉及'}")
     else:
-        structured_report["menstrual_marital_reproductive_history"] = f"{menstrual_part}；{reproductive_part}；{sexual_part}"
+        mmr_parts.append("月经史：本次问诊已涉及")
+else:
+    mmr_parts.append("月经史：未涉及")
+
+if coverage.get("marital_reproductive_sexual_history"):
+    sexual_text = ""
+
+    if "性生活相关史：" in existing_mmr:
+        sexual_text = existing_mmr.split("性生活相关史：", 1)[1].split("；", 1)[0].strip()
+    elif "性生活/婚育相关史：" in existing_mmr:
+        sexual_text = existing_mmr.split("性生活/婚育相关史：", 1)[1].split("；", 1)[0].strip()
+    elif "婚育/性生活相关史：" in existing_mmr:
+        sexual_text = existing_mmr.split("婚育/性生活相关史：", 1)[1].split("；", 1)[0].strip()
+
+    mmr_parts.append(f"婚育/性生活相关史：{sexual_text or '本次问诊已涉及'}")
+else:
+    mmr_parts.append("婚育/性生活相关史：未涉及")
+
+structured_report["menstrual_marital_reproductive_history"] = "；".join(mmr_parts)
 
     if not coverage.get("past_history"):
         structured_report["past_history"] = "未涉及"
