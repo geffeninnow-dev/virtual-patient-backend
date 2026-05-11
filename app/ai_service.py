@@ -327,7 +327,8 @@ def _apply_report_constraints(report_data: Dict[str, Any], coverage: Dict[str, A
     对模型生成结果进行后处理：
     1. 没问到的病史维度强制标注为“未涉及”；
     2. 分数超过上限时强制压低；
-    3. 等级与分数重新匹配。
+    3. 等级与分数重新匹配；
+    4. 修复月经婚育史重复套娃问题。
     """
     structured_report = report_data.setdefault("structured_report", {})
 
@@ -339,35 +340,35 @@ def _apply_report_constraints(report_data: Dict[str, Any], coverage: Dict[str, A
     if not coverage.get("history_of_present_illness"):
         structured_report["history_of_present_illness"] = "未涉及"
 
-  # 月经、婚育、性生活相关史：只保留本次问诊实际涉及的信息，避免重复套娃。
-existing_mmr = structured_report.get("menstrual_marital_reproductive_history", "")
+    # 月经、婚育、性生活相关史：只保留本次问诊实际涉及的信息，避免重复套娃。
+    existing_mmr = structured_report.get("menstrual_marital_reproductive_history", "")
 
-mmr_parts = []
+    mmr_parts = []
 
-if coverage.get("menstrual_history"):
-    if "月经史：" in existing_mmr:
-        menstrual_text = existing_mmr.split("月经史：", 1)[1].split("；", 1)[0].strip()
-        mmr_parts.append(f"月经史：{menstrual_text or '本次问诊已涉及'}")
+    if coverage.get("menstrual_history"):
+        if "月经史：" in existing_mmr:
+            menstrual_text = existing_mmr.split("月经史：", 1)[1].split("；", 1)[0].strip()
+            mmr_parts.append(f"月经史：{menstrual_text or '本次问诊已涉及'}")
+        else:
+            mmr_parts.append("月经史：本次问诊已涉及")
     else:
-        mmr_parts.append("月经史：本次问诊已涉及")
-else:
-    mmr_parts.append("月经史：未涉及")
+        mmr_parts.append("月经史：未涉及")
 
-if coverage.get("marital_reproductive_sexual_history"):
-    sexual_text = ""
+    if coverage.get("marital_reproductive_sexual_history"):
+        sexual_text = ""
 
-    if "性生活相关史：" in existing_mmr:
-        sexual_text = existing_mmr.split("性生活相关史：", 1)[1].split("；", 1)[0].strip()
-    elif "性生活/婚育相关史：" in existing_mmr:
-        sexual_text = existing_mmr.split("性生活/婚育相关史：", 1)[1].split("；", 1)[0].strip()
-    elif "婚育/性生活相关史：" in existing_mmr:
-        sexual_text = existing_mmr.split("婚育/性生活相关史：", 1)[1].split("；", 1)[0].strip()
+        if "性生活相关史：" in existing_mmr:
+            sexual_text = existing_mmr.split("性生活相关史：", 1)[1].split("；", 1)[0].strip()
+        elif "性生活/婚育相关史：" in existing_mmr:
+            sexual_text = existing_mmr.split("性生活/婚育相关史：", 1)[1].split("；", 1)[0].strip()
+        elif "婚育/性生活相关史：" in existing_mmr:
+            sexual_text = existing_mmr.split("婚育/性生活相关史：", 1)[1].split("；", 1)[0].strip()
 
-    mmr_parts.append(f"婚育/性生活相关史：{sexual_text or '本次问诊已涉及'}")
-else:
-    mmr_parts.append("婚育/性生活相关史：未涉及")
+        mmr_parts.append(f"婚育/性生活相关史：{sexual_text or '本次问诊已涉及'}")
+    else:
+        mmr_parts.append("婚育/性生活相关史：未涉及")
 
-structured_report["menstrual_marital_reproductive_history"] = "；".join(mmr_parts)
+    structured_report["menstrual_marital_reproductive_history"] = "；".join(mmr_parts)
 
     if not coverage.get("past_history"):
         structured_report["past_history"] = "未涉及"
@@ -430,6 +431,7 @@ structured_report["menstrual_marital_reproductive_history"] = "；".join(mmr_par
         add_missing("未明确追问是否存在同房后出血或接触性出血。")
 
     return report_data
+    
 def generate_consultation_report(
     case_title: str,
     dialogue_messages: List[Dict],
